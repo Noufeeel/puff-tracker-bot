@@ -2,7 +2,6 @@ from http.server import BaseHTTPRequestHandler
 import json
 import os
 import urllib.request
-import urllib.parse
 from datetime import datetime
 import gspread
 from google.oauth2.service_account import Credentials
@@ -18,17 +17,13 @@ VENDEURS = ["Belk", "Nayel", "Nono"]
 PRIX_VENTE = 10
 ALERTE_FAIBLE = 3
 ALERTE_STOCK_TOTAL = 20
-HEURE_RESUME = 0  # 00h00
-
-# IDs Telegram des 3 utilisateurs — à remplir après premier /start
-# Laisse vide, le bot les enregistre automatiquement
-CHAT_IDS_FILE = "/tmp/chat_ids.json"
 
 # ================================================================
 # GOOGLE SHEETS
 # ================================================================
 def get_sheets():
-    creds_dict = json.loads(os.environ.get("GOOGLE_CREDS"))
+    creds_raw = os.environ.get("GOOGLE_CREDS", "")
+    creds_dict = json.loads(creds_raw)
     creds = Credentials.from_service_account_info(creds_dict, scopes=[
         "https://spreadsheets.google.com/feeds",
         "https://www.googleapis.com/auth/drive"
@@ -57,9 +52,6 @@ def append_crome(row):
 def delete_crome_row(row_idx):
     get_ws("CROMES").delete_rows(row_idx)
 
-def update_journal_statut(row_idx, statut):
-    get_ws("JOURNAL").update_cell(row_idx, 6, statut)
-
 def get_config():
     try:
         data = get_ws("CONFIG").get_all_values()
@@ -76,7 +68,7 @@ def set_config(key, value):
     data = ws.get_all_values()
     for i, row in enumerate(data):
         if row and row[0] == key:
-            ws.update_cell(i+1, 2, value)
+            ws.update_cell(i + 1, 2, value)
             return
     ws.append_row([key, value])
 
@@ -97,17 +89,20 @@ def get_stock_config():
     return {
         "cartons": int(cfg.get("CARTONS", 10)),
         "puff_par_gout": int(cfg.get("PUFF_PAR_GOUT", 10)),
-        "prix_vente": int(cfg.get("PRIX_VENTE", 10)),
+        "prix_vente": int(cfg.get("PRIX_VENTE", PRIX_VENTE)),
         "cout_achat": int(cfg.get("COUT_ACHAT", 53)),
     }
 
 # ================================================================
-# CHAT IDS (notifications)
+# CHAT IDS — stockés dans Google Sheets (onglet CONFIG)
 # ================================================================
 def load_chat_ids():
+    cfg = get_config()
+    ids_str = cfg.get("CHAT_IDS", "")
+    if not ids_str:
+        return []
     try:
-        with open(CHAT_IDS_FILE, "r") as f:
-            return json.load(f)
+        return [int(x) for x in ids_str.split(",") if x.strip()]
     except:
         return []
 
@@ -115,12 +110,10 @@ def save_chat_id(chat_id):
     ids = load_chat_ids()
     if chat_id not in ids:
         ids.append(chat_id)
-        with open(CHAT_IDS_FILE, "w") as f:
-            json.dump(ids, f)
+        set_config("CHAT_IDS", ",".join(str(x) for x in ids))
 
 def notify_all(text, exclude_chat_id=None):
-    ids = load_chat_ids()
-    for cid in ids:
+    for cid in load_chat_ids():
         if cid != exclude_chat_id:
             send_message(cid, text)
 
@@ -129,24 +122,24 @@ def notify_everyone(text):
         send_message(cid, text)
 
 # ================================================================
-# SESSION
+# SESSION — stockée dans Google Sheets (onglet CONFIG)
 # ================================================================
 def get_session(chat_id):
+    cfg = get_config()
+    key = f"SESSION_{chat_id}"
+    raw = cfg.get(key, "")
+    if not raw:
+        return {}
     try:
-        with open(f"/tmp/s_{chat_id}.json", "r") as f:
-            return json.load(f)
+        return json.loads(raw)
     except:
         return {}
 
 def set_session(chat_id, data):
-    with open(f"/tmp/s_{chat_id}.json", "w") as f:
-        json.dump(data, f)
+    set_config(f"SESSION_{chat_id}", json.dumps(data))
 
 def clear_session(chat_id):
-    try:
-        os.remove(f"/tmp/s_{chat_id}.json")
-    except:
-        pass
+    set_config(f"SESSION_{chat_id}", "")
 
 # ================================================================
 # STOCK HELPERS
@@ -159,7 +152,13 @@ def get_stock_restant(flavor):
 
 def get_all_stock():
     flavors = get_flavors()
-    return {f: get_stock_restant(f) for f in flavors}
+    data = get_journal()
+    cfg = get_stock_config()
+    stock = {}
+    for f in flavors:
+        count = sum(1 for row in data[1:] if len(row) > 2 and row[2] == f)
+        stock[f] = cfg["puff_par_gout"] - count
+    return stock
 
 def get_stats():
     data = get_journal()
@@ -273,26 +272,18 @@ def send_document(chat_id, filename, content, caption=""):
         print(f"Send doc error: {e}")
 
 # ================================================================
-# MENUS PRINCIPAUX
+# MENUS
 # ================================================================
 def send_welcome(chat_id, nom=""):
-    greeting = f"👋 Salut *{nom}* !" if nom else "👋 *Puff Tracker*"
-    
-    # Stats rapides du jour
+    greeting = f"Salut *{nom}* !" if nom else "*Puff Tracker*"
     data = get_journal()
     today = datetime.now().strftime("%d/%m/%Y")
     ventes_today = sum(1 for row in data[1:] if len(row) > 6 and row[0] == today and row[6] == "Vente")
-    
+
     send_keyboard(chat_id,
-        f"{greeting}\n\n"
+        f"👋 {greeting}\n\n"
         f"📅 Ventes aujourd'hui : *{ventes_today}*\n\n"
-        f"➕ /vente — Nouvelle transaction\n"
-        f"📊 /stats — Résumé complet\n"
-        f"🍬 /gouts — Stock par goût\n"
-        f"⏳ /paye — Encaisser un crome\n"
-        f"🔄 /annuler — Annuler une vente\n"
-        f"📦 /newstock — Nouveau stock\n"
-        f"❓ /aide — Ce message",
+        f"Que veux-tu faire ?",
         [
             [{"text": "➕ Nouvelle vente", "callback_data": "menu:vente"}],
             [{"text": "📊 Stats", "callback_data": "menu:stats"}, {"text": "🍬 Goûts", "callback_data": "menu:gouts"}],
@@ -303,23 +294,22 @@ def send_welcome(chat_id, nom=""):
 
 def send_stats(chat_id):
     s = get_stats()
-    vpv = s["ventes_par_vendeur"]
-    top = sorted(vpv.items(), key=lambda x: x[1], reverse=True)
+    top = sorted(s["ventes_par_vendeur"].items(), key=lambda x: x[1], reverse=True)
     top_str = " | ".join([f"{n}: {v}" for n, v in top])
 
     send_keyboard(chat_id,
-        f"📊 *RÉSUMÉ PUFF TRACKER*\n"
+        f"📊 *RESUME PUFF TRACKER*\n"
         f"━━━━━━━━━━━━━━━━━━━━\n\n"
         f"📦 Restantes : *{s['restantes']}/{s['total_stock']}*\n"
         f"✅ Vendues : *{s['vendues']}*\n\n"
-        f"💶 CA encaissé : *{s['ca']} EUR*\n"
+        f"💶 CA encaisse : *{s['ca']} EUR*\n"
         f"🎯 Objectif : *{s['objectif']} EUR*\n"
         f"{s['bar_str']} *{s['progress']}%*\n"
-        f"💰 Bénéfice : *{s['benefice']} EUR*\n\n"
+        f"💰 Benefice : *{s['benefice']} EUR*\n\n"
         f"💳 Paylib : *{s['paylib']} EUR*\n"
         f"💵 Liquide : *{s['liquide']} EUR*\n"
         f"⏳ Cromes : *{s['crome_total']} EUR*\n\n"
-        f"🎁 Réductions : *{s['reductions']}*\n"
+        f"🎁 Reductions : *{s['reductions']}*\n"
         f"🔧 Arrangements : *{s['arrangements']}*\n\n"
         f"👥 *Ventes par vendeur :*\n{top_str}",
         [
@@ -331,7 +321,7 @@ def send_stats(chat_id):
 
 def send_gouts(chat_id):
     stock = get_all_stock()
-    msg = "🍬 *GOÛTS DISPONIBLES*\n━━━━━━━━━━━━━━━━━━━━\n\n"
+    msg = "🍬 *GOUTS DISPONIBLES*\n━━━━━━━━━━━━━━━━━━━━\n\n"
     for f, r in stock.items():
         icon = "❌" if r <= 0 else "⚠️" if r <= ALERTE_FAIBLE else "✅"
         msg += f"{icon} {f} : *{r}*\n"
@@ -352,19 +342,19 @@ def ask_flavor(chat_id):
     for i in range(0, len(items), 2):
         row = []
         for j in range(2):
-            if i+j < len(items):
-                f, r = items[i+j]
-                label = f"❌ {f} — 0" if r <= 0 else f"{'⚠️' if r <= ALERTE_FAIBLE else '✅'} {f} — {r}"
+            if i + j < len(items):
+                f, r = items[i + j]
+                label = f"❌ {f} - 0" if r <= 0 else f"{'⚠️' if r <= ALERTE_FAIBLE else '✅'} {f} - {r}"
                 row.append({"text": label, "callback_data": f"flavor:{f}"})
         rows.append(row)
     rows.append([{"text": "❌ Annuler", "callback_data": "cancel"}])
-    send_keyboard(chat_id, "🍬 *Quel goût ?*", rows)
+    send_keyboard(chat_id, "🍬 *Quel gout ?*", rows)
 
 def ask_payment(chat_id):
     send_keyboard(chat_id, "💰 *Mode de paiement ?*", [
         [{"text": "💵 Liquide", "callback_data": "pay:Liquide"}, {"text": "💳 Paylib", "callback_data": "pay:Paylib"}],
         [{"text": "⏳ Crome", "callback_data": "pay:Crome"}],
-        [{"text": "🎁 Offert — Réduction", "callback_data": "pay:Offert"}, {"text": "🔧 Arrangement", "callback_data": "pay:Arrangement"}],
+        [{"text": "🎁 Reduction", "callback_data": "pay:Offert"}, {"text": "🔧 Arrangement", "callback_data": "pay:Arrangement"}],
         [{"text": "❌ Annuler", "callback_data": "cancel"}]
     ])
 
@@ -375,18 +365,16 @@ def ask_vendeur(chat_id):
 
 def show_confirm(chat_id, session):
     prenom_client = f"\n👤 Client : *{session.get('prenom_client')}*" if session.get("prenom_client") else ""
-    msg = (
-        f"📝 *Récap :*\n\n"
+    send_keyboard(chat_id,
+        f"📝 *Recap :*\n\n"
         f"🍬 {session.get('flavor')}\n"
         f"💰 {session.get('payment')}\n"
         f"👤 Vendeur : *{session.get('vendeur')}*"
         f"{prenom_client}\n"
         f"💶 {session.get('prix')} EUR\n\n"
-        f"✅ Confirmer ?"
+        f"✅ Confirmer ?",
+        [[{"text": "✅ Oui", "callback_data": "confirm:oui"}, {"text": "❌ Non", "callback_data": "confirm:non"}]]
     )
-    send_keyboard(chat_id, msg, [
-        [{"text": "✅ Oui", "callback_data": "confirm:oui"}, {"text": "❌ Non", "callback_data": "confirm:non"}]
-    ])
 
 def save_transaction(chat_id, session):
     now = datetime.now()
@@ -408,32 +396,28 @@ def save_transaction(chat_id, session):
     restantes = get_stock_restant(flavor)
     clear_session(chat_id)
 
-    # Notification aux autres
     notif_map = {
-        "Vente": f"🛒 *{vendeur}* a vendu *{flavor}* — {prix}€ ({payment})",
-        "Crome": f"⏳ *{vendeur}* a créé un crome pour *{prenom_client}* — {flavor} ({prix}€)",
-        "Reduction": f"🎁 *{vendeur}* a offert *{flavor}* (réduction)",
-        "Arrangement": f"🔧 *{vendeur}* a fait un arrangement — *{flavor}*",
+        "Vente": f"🛒 *{vendeur}* a vendu *{flavor}* - {prix}EUR ({payment})",
+        "Crome": f"⏳ *{vendeur}* a cree un crome pour *{prenom_client}* - {flavor} ({prix}EUR)",
+        "Reduction": f"🎁 *{vendeur}* a offert *{flavor}* (reduction)",
+        "Arrangement": f"🔧 *{vendeur}* a fait un arrangement - *{flavor}*",
     }
     notify_all(notif_map.get(cat, f"📝 Nouvelle transaction par {vendeur}"), exclude_chat_id=chat_id)
 
-    # Alerte stock
     if restantes == 0:
-        notify_everyone(f"❌ *{flavor}* est épuisé !")
+        notify_everyone(f"❌ *{flavor}* est epuise !")
     elif restantes <= ALERTE_FAIBLE:
-        notify_everyone(f"⚠️ *{flavor}* — Plus que *{restantes}* restants !")
+        notify_everyone(f"⚠️ *{flavor}* - Plus que *{restantes}* restants !")
 
-    # Alerte stock total
     s = get_stats()
     if s["restantes"] <= ALERTE_STOCK_TOTAL:
         notify_everyone(f"📦 Attention ! Plus que *{s['restantes']}* puff en stock au total !")
 
     send_keyboard(chat_id,
-        f"✅ *Enregistré !*\n\n"
+        f"✅ *Enregistre !*\n\n"
         f"🍬 {flavor}\n"
-        f"👤 {vendeur}"
-        f"{f' → {prenom_client}' if prenom_client else ''}\n"
-        f"💶 {prix} EUR — {statut}\n\n"
+        f"👤 {vendeur}{f' -> {prenom_client}' if prenom_client else ''}\n"
+        f"💶 {prix} EUR - {statut}\n\n"
         f"📦 *{flavor}* restantes : *{restantes}*",
         [
             [{"text": "➕ Nouvelle vente", "callback_data": "menu:vente"}],
@@ -448,9 +432,7 @@ def save_transaction(chat_id, session):
 def show_cromes(chat_id):
     data = get_cromes()
     if len(data) <= 1:
-        send_keyboard(chat_id, "✅ Aucun crome en attente !", [
-            [{"text": "🏠 Menu", "callback_data": "menu:home"}]
-        ])
+        send_keyboard(chat_id, "✅ Aucun crome en attente !", [[{"text": "🏠 Menu", "callback_data": "menu:home"}]])
         return
 
     msg = "⏳ *CROMES EN ATTENTE*\n━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -459,9 +441,11 @@ def show_cromes(chat_id):
         if len(row) >= 4:
             prenom, flavor, montant, date = row[0], row[1], row[2], row[3]
             createur = row[5] if len(row) > 5 else "?"
-            msg += f"👤 *{prenom}* — {flavor} — {montant}€\n📅 {date} | par {createur}\n\n"
-            buttons.append([{"text": f"✅ {prenom} a payé", "callback_data": f"paye:{i+1}"},
-                           {"text": f"🗑️ Supprimer", "callback_data": f"del_crome:{i+1}"}])
+            msg += f"👤 *{prenom}* - {flavor} - {montant}EUR\n📅 {date} | par {createur}\n\n"
+            buttons.append([
+                {"text": f"✅ {prenom} a paye", "callback_data": f"paye:{i + 1}"},
+                {"text": f"🗑️ Supprimer", "callback_data": f"del_crome:{i + 1}"}
+            ])
 
     buttons.append([{"text": "🏠 Menu", "callback_data": "menu:home"}])
     send_keyboard(chat_id, msg, buttons)
@@ -474,7 +458,6 @@ def payer_crome(chat_id, msg_id, row_idx):
     row = data[row_idx - 1]
     prenom, flavor, montant = row[0], row[1], row[2]
 
-    # Update journal
     jdata = get_journal()
     ws = get_ws("JOURNAL")
     for i, jrow in enumerate(jdata[1:], 2):
@@ -483,10 +466,10 @@ def payer_crome(chat_id, msg_id, row_idx):
             break
 
     delete_crome_row(row_idx)
-    notify_all(f"💰 Crome encaissé ! *{prenom}* a payé *{flavor}* — {montant}€", exclude_chat_id=chat_id)
+    notify_all(f"💰 Crome encaisse ! *{prenom}* a paye *{flavor}* - {montant}EUR", exclude_chat_id=chat_id)
 
     edit_message(chat_id, msg_id,
-        f"✅ *{prenom}* a payé !\n\n🍬 {flavor} — {montant}€\n💰 Marqué comme payé.",
+        f"✅ *{prenom}* a paye !\n\n🍬 {flavor} - {montant}EUR",
         [[{"text": "⏳ Voir cromes", "callback_data": "menu:paye"}, {"text": "🏠 Menu", "callback_data": "menu:home"}]]
     )
 
@@ -496,18 +479,18 @@ def payer_crome(chat_id, msg_id, row_idx):
 def show_annuler(chat_id):
     data = get_journal()
     if len(data) <= 1:
-        send_message(chat_id, "❌ Aucune transaction à annuler.")
+        send_message(chat_id, "❌ Aucune transaction a annuler.")
         return
 
-    last = data[1:][-5:]  # 5 dernières
+    last = data[1:][-5:]
     last.reverse()
-    msg = "🔄 *ANNULER UNE VENTE*\nChoisis la transaction à annuler :\n\n"
+    msg = "🔄 *ANNULER UNE VENTE*\nChoisis la transaction a annuler :\n\n"
     buttons = []
     for i, row in enumerate(last):
         if len(row) >= 7:
             real_idx = len(data) - i
-            label = f"{row[0]} {row[1]} — {row[2]} — {row[4]} — {row[8] if len(row) > 8 else '?'}"
-            msg += f"{i+1}. {label}\n"
+            label = f"{row[0]} {row[1]} - {row[2]} - {row[4]} - {row[8] if len(row) > 8 else '?'}"
+            msg += f"{i + 1}. {label}\n"
             buttons.append([{"text": f"🗑️ {label}", "callback_data": f"annuler:{real_idx}"}])
 
     buttons.append([{"text": "❌ Fermer", "callback_data": "cancel"}])
@@ -523,10 +506,10 @@ def confirmer_annulation(chat_id, msg_id, row_idx):
     vendeur = row[8] if len(row) > 8 else "?"
 
     delete_journal_row(row_idx)
-    notify_all(f"🔄 *{vendeur}* a annulé une vente — *{flavor}*", exclude_chat_id=chat_id)
+    notify_all(f"🔄 *{vendeur}* a annule une vente - *{flavor}*", exclude_chat_id=chat_id)
 
     edit_message(chat_id, msg_id,
-        f"✅ Transaction annulée !\n🍬 {flavor} — remis en stock.",
+        f"✅ Transaction annulee !\n🍬 {flavor} - remis en stock.",
         [[{"text": "🏠 Menu", "callback_data": "menu:home"}]]
     )
 
@@ -536,39 +519,39 @@ def confirmer_annulation(chat_id, msg_id, row_idx):
 def ask_newstock_confirm(chat_id):
     send_keyboard(chat_id,
         "⚠️ *NOUVEAU STOCK*\n\n"
-        "Tu vas réinitialiser le stock actuel.\n"
-        "Un export de l'ancien stock sera envoyé avant.\n\n"
-        "Tu es sûr ?",
+        "Tu vas reinitialiser le stock actuel.\n"
+        "Un export sera envoye avant.\n\n"
+        "Tu es sur ?",
         [
             [{"text": "✅ Oui, nouveau stock", "callback_data": "newstock:confirm"}],
             [{"text": "❌ Annuler", "callback_data": "cancel"}]
         ]
     )
 
-def export_old_stock(chat_id):
+def export_old_stock():
     s = get_stats()
     stock = get_all_stock()
     data = get_journal()
     now = datetime.now().strftime("%d/%m/%Y %H:%M")
 
     lines = [
-        f"=== EXPORT STOCK — {now} ===\n",
+        f"=== EXPORT STOCK - {now} ===\n",
         f"Stock total : {s['total_stock']} puff",
         f"Vendues : {s['vendues']}",
         f"Restantes : {s['restantes']}",
-        f"CA encaissé : {s['ca']} EUR",
-        f"Bénéfice : {s['benefice']} EUR",
+        f"CA encaisse : {s['ca']} EUR",
+        f"Benefice : {s['benefice']} EUR",
         f"Paylib : {s['paylib']} EUR",
         f"Liquide : {s['liquide']} EUR",
         f"Cromes en attente : {s['crome_total']} EUR",
-        f"Réductions : {s['reductions']}",
+        f"Reductions : {s['reductions']}",
         f"Arrangements : {s['arrangements']}",
         "\n=== VENTES PAR VENDEUR ===",
     ]
     for v, nb in s["ventes_par_vendeur"].items():
         lines.append(f"{v} : {nb} ventes")
 
-    lines.append("\n=== STOCK PAR GOÛT ===")
+    lines.append("\n=== STOCK PAR GOUT ===")
     for f, r in stock.items():
         lines.append(f"{f} : {r} restantes")
 
@@ -581,31 +564,23 @@ def export_old_stock(chat_id):
     filename = f"stock_export_{datetime.now().strftime('%d%m%Y_%H%M')}.txt"
 
     for cid in load_chat_ids():
-        send_document(cid, filename, content, caption=f"📤 Export ancien stock — {now}")
+        send_document(cid, filename, content, caption=f"📤 Export ancien stock - {now}")
 
-def reset_stock(chat_id, new_flavors, cartons, puff_par_gout):
-    # Sauvegarde config
+def reset_stock(new_flavors, cartons, puff_par_gout):
     set_config("FLAVORS", "|".join(new_flavors))
     set_config("CARTONS", str(cartons))
     set_config("PUFF_PAR_GOUT", str(puff_par_gout))
 
-    # Vide le journal
     ws = get_ws("JOURNAL")
     ws.clear()
     ws.append_row(["Date", "Heure", "Gout", "Prix (EUR)", "Paiement", "Statut", "Categorie", "Prenom Crome", "Vendeur"])
 
-    # Vide les cromes
     wsc = get_ws("CROMES")
     wsc.clear()
     wsc.append_row(["Prenom", "Gout", "Montant (EUR)", "Date", "Paiement", "Vendeur"])
 
-def start_newstock_flow(chat_id):
-    session = {"step": "newstock_cartons"}
-    set_session(chat_id, session)
-    send_message(chat_id, "📦 *Combien de cartons as-tu pris ?*\n(Tape un nombre)")
-
 # ================================================================
-# RÉSUMÉ JOURNALIER
+# RESUME JOURNALIER
 # ================================================================
 def send_resume_journalier():
     data = get_journal()
@@ -617,24 +592,24 @@ def send_resume_journalier():
     nb_today = sum(1 for row in ventes_today if len(row) > 6 and row[6] == "Vente")
 
     cromes_data = get_cromes()
-    nb_cromes = len(cromes_data) - 1
+    nb_cromes = max(0, len(cromes_data) - 1)
 
-    # Top vendeur du jour
     vpv_today = {v: 0 for v in VENDEURS}
     for row in ventes_today:
         if len(row) > 8 and row[8] in vpv_today and row[6] == "Vente":
             vpv_today[row[8]] += 1
+
     top_today = max(vpv_today, key=vpv_today.get)
     top_nb = vpv_today[top_today]
 
     msg = (
-        f"🌙 *RÉSUMÉ DU JOUR — {today}*\n"
+        f"🌙 *RESUME DU JOUR - {today}*\n"
         f"━━━━━━━━━━━━━━━━━━━━\n\n"
         f"✅ Ventes aujourd'hui : *{nb_today}*\n"
         f"💶 CA aujourd'hui : *{ca_today} EUR*\n\n"
         f"📊 CA total : *{s['ca']} EUR*\n"
         f"{s['bar_str']} *{s['progress']}%*\n"
-        f"💰 Bénéfice : *{s['benefice']} EUR*\n\n"
+        f"💰 Benefice : *{s['benefice']} EUR*\n\n"
         f"⏳ Cromes en attente : *{nb_cromes}*\n"
         f"📦 Stock restant : *{s['restantes']}*\n\n"
     )
@@ -642,13 +617,12 @@ def send_resume_journalier():
     if top_nb > 0:
         msg += f"🏆 Top vendeur du jour : *{top_today}* ({top_nb} ventes)\n\n"
 
-    # Goûts faibles
     stock = get_all_stock()
     faibles = [(f, r) for f, r in stock.items() if 0 < r <= ALERTE_FAIBLE]
     if faibles:
-        msg += "⚠️ *Goûts à renouveler :*\n"
+        msg += "⚠️ *Gouts a renouveler :*\n"
         for f, r in faibles:
-            msg += f"  • {f} : {r} restants\n"
+            msg += f"  - {f} : {r} restants\n"
 
     notify_everyone(msg)
 
@@ -660,7 +634,6 @@ def handle_message(chat_id, text):
     session = get_session(chat_id)
     step = session.get("step", "")
 
-    # Flows texte
     if step == "waiting_prenom_client":
         session["prenom_client"] = text
         session["step"] = "confirm"
@@ -673,7 +646,7 @@ def handle_message(chat_id, text):
             session["newstock_cartons"] = int(text)
             session["step"] = "newstock_puff"
             set_session(chat_id, session)
-            send_message(chat_id, "🍬 *Combien de puff par goût ?*\n(Tape un nombre)")
+            send_message(chat_id, "🍬 *Combien de puff par gout ?*\n(Tape un nombre)")
         except:
             send_message(chat_id, "❌ Tape un nombre valide.")
         return
@@ -684,9 +657,9 @@ def handle_message(chat_id, text):
             session["step"] = "newstock_flavors"
             set_session(chat_id, session)
             send_message(chat_id,
-                "📝 *Liste tes goûts*\n\n"
-                "Envoie-les séparés par des virgules :\n"
-                "_Ex: tropical fruit, kiwi passion, peach ice_"
+                "📝 *Liste tes gouts*\n\n"
+                "Envoie-les separes par des virgules :\n"
+                "Ex: tropical fruit, kiwi passion, peach ice"
             )
         except:
             send_message(chat_id, "❌ Tape un nombre valide.")
@@ -695,36 +668,32 @@ def handle_message(chat_id, text):
     if step == "newstock_flavors":
         flavors = [f.strip() for f in text.split(",") if f.strip()]
         if not flavors:
-            send_message(chat_id, "❌ Liste invalide. Sépare les goûts par des virgules.")
+            send_message(chat_id, "❌ Liste invalide. Separe les gouts par des virgules.")
             return
 
         cartons = session.get("newstock_cartons", 10)
         puff_par_gout = session.get("newstock_puff", 10)
         vendeur = session.get("vendeur_newstock", "?")
 
-        # Export ancien stock
-        export_old_stock(chat_id)
-
-        # Reset
-        reset_stock(chat_id, flavors, cartons, puff_par_gout)
+        export_old_stock()
+        reset_stock(flavors, cartons, puff_par_gout)
         clear_session(chat_id)
 
         notify_everyone(
-            f"📦 *Nouveau stock lancé par {vendeur} !*\n\n"
-            f"🛒 {cartons} cartons | {puff_par_gout} puff/goût\n"
-            f"🍬 {len(flavors)} goûts disponibles\n"
+            f"📦 *Nouveau stock lance par {vendeur} !*\n\n"
+            f"🛒 {cartons} cartons | {puff_par_gout} puff/gout\n"
+            f"🍬 {len(flavors)} gouts disponibles\n"
             f"📊 Stock total : {cartons * puff_par_gout} puff"
         )
 
         send_keyboard(chat_id,
-            f"✅ *Nouveau stock lancé !*\n\n"
-            f"📦 {cartons} cartons × {puff_par_gout} puff = *{cartons * puff_par_gout} puff*\n"
-            f"🍬 {len(flavors)} goûts enregistrés",
+            f"✅ *Nouveau stock lance !*\n\n"
+            f"📦 {cartons} cartons x {puff_par_gout} puff = *{cartons * puff_par_gout} puff*\n"
+            f"🍬 {len(flavors)} gouts enregistres",
             [[{"text": "🏠 Menu", "callback_data": "menu:home"}]]
         )
         return
 
-    # Commandes
     cmds = {
         "/start": lambda: send_welcome(chat_id),
         "/aide": lambda: send_welcome(chat_id),
@@ -746,10 +715,9 @@ def handle_callback(chat_id, data, msg_id):
 
     if data == "cancel":
         clear_session(chat_id)
-        edit_message(chat_id, msg_id, "❌ Annulé.")
+        edit_message(chat_id, msg_id, "❌ Annule.")
         return
 
-    # Menu shortcuts
     menu_map = {
         "menu:home": lambda: send_welcome(chat_id),
         "menu:vente": lambda: (clear_session(chat_id), ask_flavor(chat_id)),
@@ -763,30 +731,26 @@ def handle_callback(chat_id, data, msg_id):
         menu_map[data]()
         return
 
-    # Payer crome
     if data.startswith("paye:"):
         payer_crome(chat_id, msg_id, int(data.split(":")[1]))
         return
 
-    # Supprimer crome
     if data.startswith("del_crome:"):
         idx = int(data.split(":")[1])
         data_c = get_cromes()
         if idx <= len(data_c):
-            row = data_c[idx-1]
+            row = data_c[idx - 1]
             delete_crome_row(idx)
             edit_message(chat_id, msg_id,
-                f"🗑️ Crome de *{row[0]}* supprimé.",
+                f"🗑️ Crome de *{row[0]}* supprime.",
                 [[{"text": "⏳ Cromes", "callback_data": "menu:paye"}, {"text": "🏠 Menu", "callback_data": "menu:home"}]]
             )
         return
 
-    # Annuler vente
     if data.startswith("annuler:"):
         confirmer_annulation(chat_id, msg_id, int(data.split(":")[1]))
         return
 
-    # Nouveau stock confirm
     if data == "newstock:confirm":
         session = {"step": "newstock_vendeur"}
         set_session(chat_id, session)
@@ -804,33 +768,31 @@ def handle_callback(chat_id, data, msg_id):
         send_message(chat_id, "Tape le nombre de cartons :")
         return
 
-    # Confirm transaction
     if data == "confirm:oui":
         session = get_session(chat_id)
         save_transaction(chat_id, session)
         return
+
     if data == "confirm:non":
         clear_session(chat_id)
-        edit_message(chat_id, msg_id, "❌ Annulé.")
+        edit_message(chat_id, msg_id, "❌ Annule.")
         return
 
     session = get_session(chat_id)
 
-    # Flavor
     if data.startswith("flavor:"):
         flavor = data.replace("flavor:", "")
         restantes = get_stock_restant(flavor)
         if restantes <= 0:
-            answer_callback(msg_id, f"❌ {flavor} est épuisé !")
-            send_message(chat_id, f"❌ *{flavor}* est épuisé ! Choisis un autre goût.")
+            answer_callback(msg_id, f"❌ {flavor} est epuise !")
+            send_message(chat_id, f"❌ *{flavor}* est epuise ! Choisis un autre gout.")
             return
         session["flavor"] = flavor
         session["step"] = "payment"
         set_session(chat_id, session)
-        edit_message(chat_id, msg_id, f"🍬 Goût : *{flavor}*")
+        edit_message(chat_id, msg_id, f"🍬 Gout : *{flavor}*")
         ask_payment(chat_id)
 
-    # Payment
     elif data.startswith("pay:"):
         payment = data.replace("pay:", "")
         if payment == "Offert":
@@ -846,13 +808,12 @@ def handle_callback(chat_id, data, msg_id):
         edit_message(chat_id, msg_id, f"💰 Paiement : *{payment}*")
 
         if session["step"] == "prenom_client":
-            send_message(chat_id, "👤 Tape le *prénom du client* (crome) :")
+            send_message(chat_id, "👤 Tape le *prenom du client* (crome) :")
             session["step"] = "waiting_prenom_client"
             set_session(chat_id, session)
         else:
             ask_vendeur(chat_id)
 
-    # Vendeur
     elif data.startswith("vendeur:"):
         vendeur = data.replace("vendeur:", "")
         session["vendeur"] = vendeur
@@ -871,7 +832,6 @@ class handler(BaseHTTPRequestHandler):
         try:
             update = json.loads(body)
 
-            # Résumé journalier (appelé par cron Vercel)
             if self.path == "/api/cron":
                 send_resume_journalier()
             elif "message" in update:
@@ -893,7 +853,6 @@ class handler(BaseHTTPRequestHandler):
         self.wfile.write(b"OK")
 
     def do_GET(self):
-        # Cron job pour résumé journalier
         if self.path == "/api/cron":
             try:
                 send_resume_journalier()
